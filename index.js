@@ -1,4 +1,3 @@
-
 const EXTENSION_ID = "agent-subagent";
 const SETTINGS_KEY = "agent_subagent_v1";
 
@@ -49,7 +48,6 @@ function createPanel() {
   if (container) {
     container.appendChild(panel);
   } else {
-    // Fallback: append to body if extensions_settings not found
     panel.style.position = "fixed";
     panel.style.bottom = "10px";
     panel.style.right = "10px";
@@ -76,7 +74,6 @@ function createPanel() {
 
   document.querySelector("#asa_run").addEventListener("click", async () => {
     const s = getSettings();
-    // Get last user message from chat
     const chatData = SillyTavern.getContext().chat;
     const lastUser = chatData?.[chatData.length - 1];
     const task = lastUser?.is_user ? lastUser.mes : (s.lastTask || "Continue the current task using tools.");
@@ -94,8 +91,7 @@ function log(text) {
   const el = document.querySelector("#asa_log");
   if (!el) return;
   const time = new Date().toLocaleTimeString();
-  el.textContent += `[${time}] ${text}
-`;
+  el.textContent += `[${time}] ${text}\n`;
   el.scrollTop = el.scrollHeight;
 }
 
@@ -147,7 +143,6 @@ async function invokeTool(name, args) {
     if (result instanceof Error) {
       return { ok: false, kind: "TOOL_ERROR", result: `[TOOL_ERROR] Tool "${name}" threw: ${result.message || result}` };
     }
-    // 工具自身以 {ok:false} 结构报告失败
     if (result && typeof result === "object" && !Array.isArray(result) && result.ok === false) {
       const detail = result.error || result.errorMessage || "tool reported failure";
       return { ok: false, kind: "TOOL_FAILED", result: `[TOOL_FAILED] Tool "${name}" reported failure: ${detail}` };
@@ -160,11 +155,9 @@ async function invokeTool(name, args) {
 
 /**
  * 把受限 JS API 沙箱包装成 subagent 可调用的 function tool。
- * 沙箱执行的是 ST 公开前端 API（ctx/st），与"小白助手聊天面板"本身无关。
- * 优先使用 LittleWhiteBox 的 jsapi-runtime（带 manifest 校验），不可用时回退到内置最小沙箱，
- * 因此本扩展在没有 LittleWhiteBox 的环境也能独立运行。
  */
 const JSAPI_TOOL_NAME = "run_js_api";
+const RUN_COMMAND_TOOL_NAME = "run_command";
 
 function normalizeJsApiOutput(output) {
   if (output === undefined || output === "") return "";
@@ -176,7 +169,7 @@ function normalizeJsApiOutput(output) {
   }
 }
 
-/** 可选增强：加载 LittleWhiteBox 的 JS API manifest + 运行时（只读前端文件，不依赖助手面板）。 */
+/** 可选增强：加载 LittleWhiteBox 的 JS API manifest + 运行时。 */
 async function loadLwbJsApiRuntime() {
   const base = "/scripts/extensions/third-party/LittleWhiteBox/modules/assistant";
   const manifestResponse = await fetch(`${base}/st-jsapi-manifest.json`, { cache: "no-cache" });
@@ -187,17 +180,12 @@ async function loadLwbJsApiRuntime() {
   return { manifest, runtimeModule };
 }
 
-/**
- * 内置最小沙箱：与 LittleWhiteBox 的 executeValidatedCode 等价的核心行为
- * （AsyncFunction + "use strict" + 注入 ctx/st 与少量全局对象），
- * 但不做 manifest 校验和 requestKind 分类。
- */
+/** 内置最小沙箱。 */
 async function executeInMinimalSandbox(codeText, stContext, st) {
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const runner = new AsyncFunction(
     "ctx", "st", "JSON", "Math", "Object", "Array", "Date", "String", "Number", "Promise",
-    `\"use strict\";
-${codeText}`
+    `"use strict";\n${codeText}`
   );
   return await runner(stContext, st, JSON, Math, Object, Array, Date, String, Number, Promise);
 }
@@ -212,14 +200,11 @@ async function executeJsApiTool({ code = "", purpose = "", apiPaths = [], safety
 
   const stContext = SillyTavern.getContext();
   const st = {
-    extensions: {
-      getContext: () => stContext,
-    },
+    extensions: { getContext: () => stContext },
     script: {},
     slash: {},
   };
 
-  // 优先走 LittleWhiteBox 的完整沙箱（带 manifest 校验）
   try {
     const { manifest, runtimeModule } = await loadLwbJsApiRuntime();
     const result = await runtimeModule.runJavaScriptApi({
@@ -241,7 +226,6 @@ async function executeJsApiTool({ code = "", purpose = "", apiPaths = [], safety
       error: result?.ok ? "" : (result?.execution?.errorMessage || result?.execution?.validationErrors?.join("; ") || "jsapi_failed"),
     };
   } catch (lwbErr) {
-    // 回退：内置最小沙箱（无 LittleWhiteBox 也能跑）
     try {
       const output = await executeInMinimalSandbox(codeText, stContext, st);
       return {
@@ -261,6 +245,57 @@ async function executeJsApiTool({ code = "", purpose = "", apiPaths = [], safety
 }
 
 let jsApiToolRegistered = false;
+let runCommandToolRegistered = false;
+
+/** 注册 run_command 工具到 ToolManager（幂等）。执行 slash 命令并返回 pipe 输出。 */
+function registerRunCommandTool() {
+  if (runCommandToolRegistered) return true;
+  try {
+    const ctx = SillyTavern.getContext();
+    if (typeof ctx.registerFunctionTool !== "function") return false;
+    ctx.registerFunctionTool({
+      name: RUN_COMMAND_TOOL_NAME,
+      displayName: "执行 slash 命令",
+      description:
+        "执行一条 SillyTavern slash 命令（STscript）并返回执行结果。" +
+        "返回对象包含 pipe（命令输出值）、isError、interrupt 等字段。" +
+        "示例：/findentry file=新世界书 field=key 苏哲、/getvar name={{char}}、/setentryfield file=新世界书 uid=123 field=content 新内容",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "slash 命令文本，以 / 开头，如 /findentry file=新世界书 field=key 苏哲" },
+        },
+        required: ["command"],
+      },
+      action: async ({ command = "" } = {}) => {
+        const cmd = String(command || "").trim();
+        if (!cmd || !cmd.startsWith("/")) {
+          return { ok: false, error: "invalid_command", message: "command 必须以 / 开头的 slash 命令。" };
+        }
+        try {
+          const result = await st.slash.executeSlashCommandsWithOptions(cmd, { source: "agent-subagent" });
+          return {
+            ok: !result?.isError,
+            pipe: result?.pipe || "",
+            isError: Boolean(result?.isError),
+            interrupt: Boolean(result?.interrupt),
+            errorMessage: result?.errorMessage || "",
+          };
+        } catch (err) {
+          return { ok: false, error: "execution_failed", message: err?.message || String(err) };
+        }
+      },
+      formatMessage: ({ command = "" } = {}) => `CMD: ${String(command).slice(0, 100)}`,
+      shouldRegister: () => true,
+      stealth: false,
+    });
+    runCommandToolRegistered = true;
+    return true;
+  } catch (err) {
+    console.warn("[agent-subagent] run_command 注册失败:", err?.message || err);
+    return false;
+  }
+}
 
 /** 注册 JS API 工具到 ToolManager（幂等）。 */
 function registerJsApiTool() {
@@ -291,7 +326,7 @@ function registerJsApiTool() {
         required: ["code", "purpose", "expectedOutput"],
       },
       action: async (params = {}) => executeJsApiTool(params),
-      formatMessage: (params = {}) => `JS API: ${String(params.purpose || params.code || "").slice(0, 80)}`,
+      formatMessage: (params = {}) => `JS API: ${String(params.purpose || params.code || "")}.slice(0, 80)`,
       shouldRegister: () => true,
       stealth: false,
     });
@@ -303,11 +338,8 @@ function registerJsApiTool() {
   }
 }
 
-
 /**
- * 调用 LLM：优先直连 ST 后端 /api/backends/chat-completions/generate，
- * 请求体里显式带 tools，保证 tool_calls 循环能跑起来。
- * 该端点由 SillyTavern 后端代理转发到当前 Chat Completion 源，tools 参数会原样透传。
+ * 调用 LLM：优先直连 ST 后端 /api/backends/chat-completions/generate。
  */
 async function callSubagentLLM(messages, tools) {
   const ctx = SillyTavern.getContext();
@@ -342,7 +374,6 @@ async function callSubagentLLM(messages, tools) {
     generateData.proxy_password = settings.proxy_password;
   }
 
-  // Custom OpenAI 源需要显式提供 custom_url 等字段（openai.js:2922）
   if (settings.chat_completion_source === "custom") {
     generateData.custom_url = settings.custom_url;
     if (settings.custom_include_body) generateData.custom_include_body = settings.custom_include_body;
@@ -412,8 +443,8 @@ async function runSubagent(task) {
     }
   }
 
-  // 确保 JS API 工具在工具表里（幂等：已注册过会直接返回）
   registerJsApiTool();
+  registerRunCommandTool();
   if (s.autoAttachTools) {
     const refreshed = getRegisteredTools();
     if (refreshed.length > tools.length) {
@@ -431,14 +462,12 @@ async function runSubagent(task) {
 
       log(`Loop ${loop}/${maxLoops}`);
 
-      // 深拷贝后再发请求，避免 ST 内部处理原地改写 messages
       const snapshot = typeof structuredClone === "function"
         ? structuredClone(messages)
         : JSON.parse(JSON.stringify(messages));
 
       const data = await callSubagentLLM(snapshot, tools);
 
-      // Extract the response
       let content = "";
       let toolCalls = [];
 
@@ -460,8 +489,7 @@ async function runSubagent(task) {
       }
 
       if (toolCalls.length === 0) {
-        log(`Subagent finished:
-${content}`);
+        log(`Subagent finished:\n${content}`);
         break;
       }
 
@@ -496,7 +524,6 @@ ${content}`);
         });
       }
 
-      // Push the assistant message with tool calls
       messages.push({
         role: "assistant",
         content: content,
@@ -516,6 +543,8 @@ export async function init() {
   createPanel();
   log("Agent & Subagent extension loaded.");
   log(`Registered tools available: ${getRegisteredTools().length}`);
+  const cmdOk = registerRunCommandTool();
+  log(cmdOk ? "run_command tool registered." : "run_command tool not registered (ToolManager unavailable).");
   const jsApiOk = registerJsApiTool();
   log(jsApiOk ? "JS API tool registered (run_js_api)." : "JS API tool not registered (ToolManager unavailable).");
 }
