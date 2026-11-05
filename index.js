@@ -153,9 +153,6 @@ async function invokeTool(name, args) {
   }
 }
 
-/**
- * 把受限 JS API 沙箱包装成 subagent 可调用的 function tool。
- */
 const JSAPI_TOOL_NAME = "run_js_api";
 const RUN_COMMAND_TOOL_NAME = "run_command";
 
@@ -169,7 +166,6 @@ function normalizeJsApiOutput(output) {
   }
 }
 
-/** 可选增强：加载 LittleWhiteBox 的 JS API manifest + 运行时。 */
 async function loadLwbJsApiRuntime() {
   const base = "/scripts/extensions/third-party/LittleWhiteBox/modules/assistant";
   const manifestResponse = await fetch(`${base}/st-jsapi-manifest.json`, { cache: "no-cache" });
@@ -180,7 +176,6 @@ async function loadLwbJsApiRuntime() {
   return { manifest, runtimeModule };
 }
 
-/** 内置最小沙箱。 */
 async function executeInMinimalSandbox(codeText, stContext, st) {
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const runner = new AsyncFunction(
@@ -200,7 +195,9 @@ async function executeJsApiTool({ code = "", purpose = "", apiPaths = [], safety
 
   const stContext = SillyTavern.getContext();
   const st = {
-    extensions: { getContext: () => stContext },
+    extensions: {
+      getContext: () => stContext,
+    },
     script: {},
     slash: {},
   };
@@ -326,7 +323,7 @@ function registerJsApiTool() {
         required: ["code", "purpose", "expectedOutput"],
       },
       action: async (params = {}) => executeJsApiTool(params),
-      formatMessage: (params = {}) => `JS API: ${String(params.purpose || params.code || "")}.slice(0, 80)`,
+      formatMessage: (params = {}) => `JS API: ${String(params.purpose || params.code || "").slice(0, 80)}`,
       shouldRegister: () => true,
       stealth: false,
     });
@@ -338,9 +335,6 @@ function registerJsApiTool() {
   }
 }
 
-/**
- * 调用 LLM：优先直连 ST 后端 /api/backends/chat-completions/generate。
- */
 async function callSubagentLLM(messages, tools) {
   const ctx = SillyTavern.getContext();
   const settings = ctx.chatCompletionSettings;
@@ -422,21 +416,6 @@ async function runSubagent(task) {
   log(`Subagent started: ${subagentName}`);
   log(`Task: ${task}`);
 
-  const systemPrompt =
-    `You are a subagent named ${subagentName}. ` +
-    `Your job is to complete the task by planning, calling tools, and iterating until you have a final answer. ` +
-    `When you call tools, wait for their results before concluding. ` +
-    `When you are done, return only the final answer. ` +
-    `IMPORTANT tool-calling rules: ` +
-    `(1) Any tool that is already in your function/tool list (e.g. chat_fetch, chat_read, chats_list, chat_stats, worldbook_read, worldbook_write, run_command, run_js_api) MUST be called directly as a function call with its JSON arguments object — do NOT wrap it in a /tools-invoke slash command. ` +
-    `(2) /tools-invoke is only a fallback for tools you can NOT call directly. Its parser splits on spaces, so the parameters JSON must be wrapped in double quotes with the inner double quotes escaped. Correct example: /tools-invoke parameters="{\"file_name\":\"Assistant - 2026-10-01@18h00m37s598ms\",\"start\":0,\"limit\":10}" chat_fetch. Bare JSON that contains spaces (like a file_name) will be truncated and fail. ` +
-    `(3) Prefer direct function calls; they handle spaces and any JSON value correctly.`;
-
-  const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: task },
-  ];
-
   let tools = [];
   if (s.autoAttachTools) {
     tools = getRegisteredTools();
@@ -448,7 +427,6 @@ async function runSubagent(task) {
   }
 
   registerJsApiTool();
-  registerRunCommandTool();
   if (s.autoAttachTools) {
     const refreshed = getRegisteredTools();
     if (refreshed.length > tools.length) {
@@ -456,6 +434,31 @@ async function runSubagent(task) {
       log(`Attached ${tools.length} registered tool(s): ${tools.map(t => t.function.name).join(", ")}`);
     }
   }
+
+  // 工具白名单：排除会递归派生 subagent 的工具，避免无限套娃
+  const EXCLUDED_TOOLS = new Set(["subagent_run", "spawn_agents"]);
+  const attachedNames = tools.map(t => t.function.name).filter(n => !EXCLUDED_TOOLS.has(n));
+  const systemPrompt =
+    `You are a subagent named ${subagentName}. ` +
+    `Your job is to complete the task by planning, calling tools, and iterating until you have a final answer. ` +
+    `When you call tools, wait for their results before concluding. ` +
+    `When you are done, return only the final answer. ` +
+    (attachedNames.length > 0
+      ? `Your available tools are exactly: ${attachedNames.join(", ")}. ` +
+        `You MUST call them directly as function calls with their JSON arguments object — do NOT wrap any of them in a /tools-invoke slash command. ` +
+        `Only use /tools-invoke as a last resort for a tool that is NOT in this list; if you must, the parameters JSON must be wrapped in double quotes with inner double quotes escaped. ` +
+        `Do NOT call subagent_run or spawn_agents (no recursion). `
+      : `You have NO direct tools in this run. Use slash commands (e.g. /tools-invoke parameters="{...}" <tool>) to access functionality; the parameters JSON must be wrapped in double quotes with inner double quotes escaped. ` +
+        `Do NOT call subagent_run or spawn_agents (no recursion). ` ) +
+    `IMPORTANT tool-calling rules: ` +
+    ` (1) Any tool that is already in your function/tool list (e.g. chat_fetch, chat_read, chats_list, chat_stats, worldbook_read, worldbook_write, run_command, run_js_api) MUST be called directly as a function call with its JSON arguments object — do NOT wrap it in a /tools-invoke slash command. ` +
+    ` (2) /tools-invoke is only a fallback for tools you can NOT call directly. Its parser splits on spaces, so the parameters JSON must be wrapped in double quotes with the inner double quotes escaped. Correct example: /tools-invoke parameters="{\\\"file_name\\\":\\\"Assistant - 2026-10-01@18h00m37s598ms\\\",\\\"start\\\":0,\\\"limit\\\":10}" chat_fetch. Bare JSON that contains spaces (like a file_name) will be truncated and fail. ` +
+    ` (3) Prefer direct function calls; they handle spaces and any JSON value correctly.`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: task },
+  ];
 
   try {
     for (let loop = 1; loop <= maxLoops; loop++) {
@@ -533,7 +536,6 @@ async function runSubagent(task) {
         content: content,
         tool_calls: toolCalls,
       });
-
     }
   } catch (err) {
     log(`Subagent error: ${err?.message || err}`);
