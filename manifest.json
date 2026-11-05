@@ -3,8 +3,8 @@
   "loading_order": 9,
   "requires": [],
   "optional": [],
-  "author": "your-github-name",
-  "version": "1.0.0",
-  "homeUrl": "https://github.com/your-github-name/sillytavern-agent-subagent",
+  "author": "NeroWang666",
+  "version": "1.3.0",
+  "homeUrl": "https://github.com/NeroWang666/sillytavern-agent-subagent",
   "script": "index.js"
 }
