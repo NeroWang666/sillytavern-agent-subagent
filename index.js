@@ -426,7 +426,11 @@ async function runSubagent(task) {
     `You are a subagent named ${subagentName}. ` +
     `Your job is to complete the task by planning, calling tools, and iterating until you have a final answer. ` +
     `When you call tools, wait for their results before concluding. ` +
-    `When you are done, return only the final answer.`;
+    `When you are done, return only the final answer. ` +
+    `IMPORTANT tool-calling rules: ` +
+    `(1) Any tool that is already in your function/tool list (e.g. chat_fetch, chat_read, chats_list, chat_stats, worldbook_read, worldbook_write, run_command, run_js_api) MUST be called directly as a function call with its JSON arguments object — do NOT wrap it in a /tools-invoke slash command. ` +
+    `(2) /tools-invoke is only a fallback for tools you can NOT call directly. Its parser splits on spaces, so the parameters JSON must be wrapped in double quotes with the inner double quotes escaped. Correct example: /tools-invoke parameters="{\"file_name\":\"Assistant - 2026-10-01@18h00m37s598ms\",\"start\":0,\"limit\":10}" chat_fetch. Bare JSON that contains spaces (like a file_name) will be truncated and fail. ` +
+    `(3) Prefer direct function calls; they handle spaces and any JSON value correctly.`;
 
   const messages = [
     { role: "system", content: systemPrompt },
