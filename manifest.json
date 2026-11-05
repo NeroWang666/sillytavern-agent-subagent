@@ -1,0 +1,10 @@
+{
+  "display_name": "Agent & Subagent",
+  "loading_order": 9,
+  "requires": [],
+  "optional": [],
+  "author": "your-github-name",
+  "version": "1.0.0",
+  "homeUrl": "https://github.com/your-github-name/sillytavern-agent-subagent",
+  "script": "index.js"
+}
