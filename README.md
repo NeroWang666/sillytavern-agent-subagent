@@ -6,7 +6,6 @@ Adds an autonomous **subagent loop** to SillyTavern: a small agent that takes a 
 
 - SillyTavern with a **Chat Completion** backend configured. The subagent posts to `/api/backends/chat-completions/generate` with an explicit `tools` array plus `tool_choice: "auto"`, so your model/source must support function calling.
 - **No third-party extension is required.** Everything this extension touches is SillyTavern core: `SillyTavern.getContext()`, `ctx.registerFunctionTool` and `ctx.ToolManager.invokeFunctionTool` (`scripts/tool-calling.js:269` / `:325`), `ctx.chatCompletionSettings` + `ctx.getRequestHeaders()` + `ctx.getChatCompletionModel()`, `ctx.chat` / `ctx.addOneMessage` / `ctx.saveChat()`, `/scripts/slash-commands.js` (`executeSlashCommandsWithOptions`), `/scripts/i18n.js`, and the standard settings-panel DOM/CSS (`#extensions_settings`, `inline-drawer`, `.text_pole`).
-- **LittleWhiteBox is optional.** `run_js_api` prefers LittleWhiteBox's manifest-validated jsapi-runtime; when it is absent the tool falls back to a built-in minimal sandbox (strict-mode AsyncFunction with injected `ctx` / `st`), so the extension runs standalone — just without per-path API validation.
 
 ## Install
 
