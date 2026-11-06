@@ -24,9 +24,23 @@ function saveSettings(s) {
   } catch {}
 }
 
+let panelAttached = false;
+
+function attachPanel(panel) {
+  if (panelAttached) return;
+  const container = document.querySelector("#extensions_settings");
+  if (container) {
+    panelAttached = true;
+    container.appendChild(panel);
+    return true;
+  }
+  return false;
+}
+
 function createPanel() {
   const panel = document.createElement("div");
   panel.id = "agent_subagent_panel";
+  panel.classList.add("extension_container");
   panel.style.padding = "10px";
 
   panel.innerHTML = `
@@ -44,18 +58,26 @@ function createPanel() {
     <pre id="asa_log" style="margin-top:8px;white-space:pre-wrap;max-height:280px;overflow:auto;background:#111;padding:8px;border-radius:6px;"></pre>
   `;
 
-  const container = document.querySelector("#extensions_settings");
-  if (container) {
-    container.appendChild(panel);
-  } else {
-    panel.style.position = "fixed";
-    panel.style.bottom = "10px";
-    panel.style.right = "10px";
-    panel.style.zIndex = "9999";
-    panel.style.background = "#222";
-    panel.style.border = "1px solid #555";
-    panel.style.borderRadius = "8px";
-    document.body.appendChild(panel);
+  if (!attachPanel(panel)) {
+    const tryAttach = () => attachPanel(panel);
+    if (typeof MutationObserver !== "undefined") {
+      const observer = new MutationObserver(() => { if (tryAttach()) observer.disconnect(); });
+      observer.observe(document.body, { childList: true, subtree: true });
+      setTimeout(() => observer.disconnect(), 10000);
+    }
+    setTimeout(() => {
+      if (!panelAttached) {
+        panel.style.position = "fixed";
+        panel.style.bottom = "10px";
+        panel.style.right = "10px";
+        panel.style.zIndex = "9999";
+        panel.style.background = "#222";
+        panel.style.border = "1px solid #555";
+        panel.style.borderRadius = "8px";
+        document.body.appendChild(panel);
+        panelAttached = true;
+      }
+    }, 10000);
   }
 
   const s = getSettings();
@@ -93,8 +115,65 @@ function log(text) {
   const time = new Date().toLocaleTimeString();
   el.textContent += `[${time}] ${text}\n`;
   el.scrollTop = el.scrollHeight;
+  asaChatLogs.push(`[${time}] ${text}`);
+  if (asaChatMsgId) asaChatUpdate("运行中");
 }
 
+/* ---------------- 聊天内运行状态消息 ---------------- */
+let asaChatMsgId = null;
+let asaChatLogs = [];
+let asaTaskText = "";
+
+function asaEscapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function asaRenderBody(status, finalText) {
+  let body = `<div style="margin:4px 0;"><b>任务:</b> ${asaEscapeHtml(asaTaskText)}</div>`;
+  body += `<div style="margin:4px 0;"><b>状态:</b> ${asaEscapeHtml(status || "运行中")}</div>`;
+  if (finalText) body += `<div style="margin:4px 0;"><b>最终输出:</b></div><div style="white-space:pre-wrap;">${asaEscapeHtml(finalText)}</div>`;
+  if (asaChatLogs.length) body += `<div style="margin:4px 0;"><b>日志:</b></div><div style="white-space:pre-wrap;max-height:320px;overflow:auto;">${asaChatLogs.map(l => asaEscapeHtml(l)).join("<br>")}</div>`;
+  return body;
+}
+
+/** 启动时推一条系统消息进当前聊天（与 ST 工具调用消息同款：is_system + isSmallSys）。 */
+function asaChatStart(task) {
+  asaChatMsgId = null;
+  asaChatLogs = [];
+  asaTaskText = task;
+  try {
+    const ctx = SillyTavern.getContext();
+    if (!Array.isArray(ctx.chat) || ctx.chat.length === 0) return;
+    const id = Date.now() + "_asa_" + Math.random().toString(36).slice(2, 8);
+    const mes = `<details><summary>Subagent · 运行中</summary><div class="asa_chat_body">${asaRenderBody("运行中")}</div></details>`;
+    ctx.chat.push({ name: ctx.name2, force_avatar: true, is_system: true, is_user: false, mes, extra: { isSmallSys: true }, unique_id: id });
+    try {
+      ctx.addOneMessage({ id, mes, name: ctx.name2, is_system: true, is_user: false, force_avatar: true, extra: { isSmallSys: true } }, { scroll: true });
+    } catch (e) { console.warn("[agent-subagent] addOneMessage failed:", e); }
+    asaChatMsgId = id;
+  } catch (e) { console.warn("[agent-subagent] asaChatStart failed:", e); }
+}
+
+/** 运行中/结束时就地更新聊天里的状态消息（点开可看当前输出）。 */
+function asaChatUpdate(status, finalText) {
+  if (!asaChatMsgId) return;
+  try {
+    const ctx = SillyTavern.getContext();
+    const m = ctx.chat.find(x => x && (x.unique_id === asaChatMsgId || x.id === asaChatMsgId));
+    if (!m) return;
+    m.mes = `<details><summary>Subagent · ${asaEscapeHtml(status)}</summary><div class="asa_chat_body">${asaRenderBody(status, finalText)}</div></details>`;
+    const el = document.querySelector(`#mes_${asaChatMsgId}`);
+    if (el) el.innerHTML = m.mes;
+  } catch (e) { console.warn("[agent-subagent] asaChatUpdate failed:", e); }
+}
+
+/** 结束后持久化当前聊天。 */
+async function asaChatSave() {
+  try {
+    const ctx = SillyTavern.getContext();
+    if (typeof ctx.saveChatConditional === "function") await ctx.saveChatConditional();
+  } catch (e) { console.warn("[agent-subagent] saveChatConditional failed:", e); }
+}
 /**
  * Collect all currently registered tools from ToolManager
  * and convert them to OpenAI function calling format.
@@ -413,6 +492,7 @@ async function runSubagent(task) {
   const maxLoops = s.maxLoops ?? 8;
   const subagentName = s.subagentName || "Subagent";
 
+  asaChatStart(task);
   log(`Subagent started: ${subagentName}`);
   log(`Task: ${task}`);
 
@@ -464,6 +544,7 @@ async function runSubagent(task) {
     for (let loop = 1; loop <= maxLoops; loop++) {
       if (stopRequested) {
         log("Subagent stopped by user.");
+        asaChatUpdate("已停止");
         break;
       }
 
@@ -492,10 +573,12 @@ async function runSubagent(task) {
 
       if (!content && toolCalls.length === 0) {
         log("Empty response from model.");
+        asaChatUpdate("结束（空响应）");
         break;
       }
 
       if (toolCalls.length === 0) {
+        asaChatUpdate("已完成", content);
         log(`Subagent finished:\n${content}`);
         break;
       }
@@ -539,9 +622,11 @@ async function runSubagent(task) {
     }
   } catch (err) {
     log(`Subagent error: ${err?.message || err}`);
+    asaChatUpdate("出错", String(err?.message || err));
   } finally {
     running = false;
     stopRequested = false;
+    await asaChatSave();
   }
 }
 
