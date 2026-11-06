@@ -4,7 +4,7 @@
   "requires": [],
   "optional": [],
   "author": "NeroWang666",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "homeUrl": "https://github.com/NeroWang666/sillytavern-agent-subagent",
   "js": "index.js",
   "hooks": {
