@@ -379,37 +379,66 @@ async function invokeTool(name, args) {
  */
 async function callSubagentLLM(messages, tools) {
   const ctx = SillyTavern.getContext();
-
-  if (typeof ctx.generateRawData !== "function") {
-    throw new Error("generateRawData is not available in this SillyTavern version.");
+  const settings = ctx.chatCompletionSettings;
+  if (!settings || typeof ctx.getRequestHeaders !== "function" || typeof ctx.getChatCompletionModel !== "function") {
+    throw new Error("缺少 chatCompletionSettings / getRequestHeaders / getChatCompletionModel，无法直连后端。");
   }
 
-  // Build a prompt from the messages array
-  // generateRawData accepts a prompt (string or array) + systemPrompt
-  let systemPrompt = "";
-  let userContent = "";
-
-  for (const msg of messages) {
-    if (msg.role === "system") {
-      systemPrompt += (systemPrompt ? "\n" : "") + (msg.content || "");
-    } else if (msg.role === "user") {
-      userContent += (userContent ? "\n" : "") + (msg.content || "");
-    } else if (msg.role === "assistant") {
-      // Append assistant messages to the prompt as context
-      userContent += (userContent ? "\n" : "") + `[Assistant]: ${msg.content || ""}`;
-    } else if (msg.role === "tool") {
-      userContent += (userContent ? "\n" : "") + `[Tool Result (${msg.tool_call_id || ""})]: ${msg.content || ""}`;
-    }
+  const model = ctx.getChatCompletionModel(settings);
+  if (!model) {
+    throw new Error("getChatCompletionModel 返回空，请检查当前 Chat Completion 设置。");
   }
 
-  // Use generateRawData with the assembled prompt
-  // Note: For proper tool calling, we need the API to support it
-  // generateRawData will use the current API's tool calling if tools are registered
-  const data = await ctx.generateRawData({
-    prompt: userContent,
-    systemPrompt: systemPrompt,
+  const generateData = {
+    type: "normal",
+    messages: messages,
+    model: model,
+    temperature: Number(settings.temp_openai),
+    frequency_penalty: Number(settings.freq_pen_openai),
+    presence_penalty: Number(settings.pres_pen_openai),
+    top_p: Number(settings.top_p_openai),
+    max_tokens: settings.openai_max_tokens,
+    stream: false,
+    chat_completion_source: settings.chat_completion_source,
+    user_name: ctx.name1,
+    char_name: ctx.name2,
+    include_reasoning: Boolean(settings.show_thoughts),
+  };
+
+  if (settings.reverse_proxy) {
+    generateData.reverse_proxy = settings.reverse_proxy;
+    generateData.proxy_password = settings.proxy_password;
+  }
+
+  if (settings.chat_completion_source === "custom") {
+    generateData.custom_url = settings.custom_url;
+    if (settings.custom_include_body) generateData.custom_include_body = settings.custom_include_body;
+    if (settings.custom_exclude_body) generateData.custom_exclude_body = settings.custom_exclude_body;
+    if (settings.custom_include_headers) generateData.custom_include_headers = settings.custom_include_headers;
+  }
+
+  if (Array.isArray(tools) && tools.length > 0) {
+    generateData.tools = tools;
+    generateData.tool_choice = "auto";
+  }
+
+  const response = await fetch("/api/backends/chat-completions/generate", {
+    method: "POST",
+    body: JSON.stringify(generateData),
+    headers: ctx.getRequestHeaders(),
+    cache: "no-cache",
   });
 
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`后端返回 ${response.status}: ${text.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  if (data?.error) {
+    const msg = data.error?.message || (typeof data.error === "string" ? data.error : JSON.stringify(data.error));
+    throw new Error(`API 错误: ${msg}`);
+  }
   return data;
 }
 
@@ -529,6 +558,224 @@ async function runSubagent(task) {
   }
 }
 
+/* slash 与 jsapi runtime 的加载入口（不依赖全局 st，也不依赖未打包的 runtime-src 源码） */
+
+async function executeAgentSlashCommand(commandText, source) {
+  const slashModule = await import("/scripts/slash-commands.js");
+  return await slashModule.executeSlashCommandsWithOptions(commandText, typeof source === "string" ? { source } : (source || {}));
+}
+
+async function buildStSlashNamespace() {
+  try {
+    const slashModule = await import("/scripts/slash-commands.js");
+    return {
+      executeSlashCommandsWithOptions: slashModule.executeSlashCommandsWithOptions,
+      getSlashCommandsHelp: slashModule.getSlashCommandsHelp,
+      registerSlashCommand: slashModule.registerSlashCommand,
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function resolveLwbJsApiRuntimeUrl() {
+  const assetBase = "/scripts/extensions/third-party/LittleWhiteBox";
+  try {
+    const buildManifestResponse = await fetch(`${assetBase}/dist/manifest.json`, { cache: "no-cache" });
+    if (buildManifestResponse.ok) {
+      const buildManifest = await buildManifestResponse.json();
+      const entry = buildManifest.entries && buildManifest.entries["runtime/assistant-jsapi"];
+      if (entry && entry.file) return `${assetBase}/dist/${entry.file}`;
+    }
+  } catch {
+  }
+  return `${assetBase}/modules/assistant/runtime-src/jsapi-runtime.js`;
+}
+
+/* run_command + run_js_api：1.5.1 误删，1.5.2 从 v1.5.0 恢复；slash 改走 /scripts/slash-commands.js（旧版依赖的全局 st 本实例不存在），jsapi runtime 改走已打包 dist chunk */
+const JSAPI_TOOL_NAME = "run_js_api";
+const RUN_COMMAND_TOOL_NAME = "run_command";
+
+function normalizeJsApiOutput(output) {
+  if (output === undefined || output === "") return "";
+  if (typeof output === "string") return output;
+  try {
+    return JSON.stringify(output, null, 2);
+  } catch {
+    return String(output);
+  }
+}
+
+async function loadLwbJsApiRuntime() {
+  const base = "/scripts/extensions/third-party/LittleWhiteBox/modules/assistant";
+  const manifestResponse = await fetch(`${base}/st-jsapi-manifest.json`, { cache: "no-cache" });
+  if (!manifestResponse.ok) throw new Error(`jsapi_manifest_load_failed:${manifestResponse.status}`);
+  const manifest = await manifestResponse.json();
+  const runtimeUrl = await resolveLwbJsApiRuntimeUrl();
+  const runtimeModule = await import(runtimeUrl);
+  if (typeof runtimeModule?.runJavaScriptApi !== "function") throw new Error("jsapi_runtime_missing_runJavaScriptApi");
+  return { manifest, runtimeModule };
+}
+
+async function executeInMinimalSandbox(codeText, stContext, st) {
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const runner = new AsyncFunction(
+    "ctx", "st", "JSON", "Math", "Object", "Array", "Date", "String", "Number", "Promise",
+    `"use strict";\n${codeText}`
+  );
+  return await runner(stContext, st, JSON, Math, Object, Array, Date, String, Number, Promise);
+}
+
+async function executeJsApiTool({ code = "", purpose = "", apiPaths = [], safety = "", expectedOutput = "" } = {}) {
+  const codeText = String(code || "").trim();
+  const purposeText = String(purpose || "").trim();
+  const expectedText = String(expectedOutput || "").trim();
+  if (!codeText || !purposeText || !expectedText) {
+    return { ok: false, error: "code、purpose、expectedOutput 均为必填。" };
+  }
+
+  const stContext = SillyTavern.getContext();
+  const st = {
+    extensions: {
+      getContext: () => stContext,
+    },
+    script: {},
+    slash: await buildStSlashNamespace(),
+  };
+
+  try {
+    const { manifest, runtimeModule } = await loadLwbJsApiRuntime();
+    const result = await runtimeModule.runJavaScriptApi({
+      code: codeText,
+      purpose: purposeText,
+      apiPaths: Array.isArray(apiPaths) ? apiPaths : [],
+      safety: String(safety || ""),
+      expectedOutput: expectedText,
+      manifest: manifest,
+      ctx: stContext,
+      st,
+    });
+
+    return {
+      ok: result?.ok === true,
+      output: normalizeJsApiOutput(result?.output),
+      requestKind: result?.requestKind || "unknown",
+      note: result?.note || "",
+      error: result?.ok ? "" : (result?.execution?.errorMessage || result?.execution?.validationErrors?.join("; ") || "jsapi_failed"),
+    };
+  } catch (lwbErr) {
+    try {
+      const output = await executeInMinimalSandbox(codeText, stContext, st);
+      return {
+        ok: true,
+        output: normalizeJsApiOutput(output),
+        requestKind: "minimal",
+        note: `LittleWhiteBox jsapi-runtime 不可用（${lwbErr?.message || lwbErr}），已回退到内置最小沙箱执行。`,
+      };
+    } catch (fallbackErr) {
+      return {
+        ok: false,
+        error: `jsapi_execution_failed: ${fallbackErr?.message || fallbackErr}`,
+        note: `LittleWhiteBox jsapi-runtime 不可用（${lwbErr?.message || lwbErr}），内置最小沙箱执行也失败。`,
+      };
+    }
+  }
+}
+
+let jsApiToolRegistered = false;
+let runCommandToolRegistered = false;
+
+/** 注册 run_command 工具到 ToolManager（幂等）。执行 slash 命令并返回 pipe 输出。 */
+function registerRunCommandTool() {
+  if (runCommandToolRegistered) return true;
+  try {
+    const ctx = SillyTavern.getContext();
+    if (typeof ctx.registerFunctionTool !== "function") return false;
+    ctx.registerFunctionTool({
+      name: RUN_COMMAND_TOOL_NAME,
+      displayName: "执行 slash 命令",
+      description:
+        "执行一条 SillyTavern slash 命令（STscript）并返回执行结果。" +
+        "返回对象包含 pipe（命令输出值）、isError、interrupt 等字段。" +
+        "示例：/findentry file=新世界书 field=key 苏哲、/getvar name={{char}}、/setentryfield file=新世界书 uid=123 field=content 新内容",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "slash 命令文本，以 / 开头，如 /findentry file=新世界书 field=key 苏哲" },
+        },
+        required: ["command"],
+      },
+      action: async ({ command = "" } = {}) => {
+        const cmd = String(command || "").trim();
+        if (!cmd || !cmd.startsWith("/")) {
+          return { ok: false, error: "invalid_command", message: "command 必须以 / 开头的 slash 命令。" };
+        }
+        try {
+          const result = await executeAgentSlashCommand(cmd, "agent-subagent");
+          return {
+            ok: !result?.isError,
+            pipe: result?.pipe || "",
+            isError: Boolean(result?.isError),
+            interrupt: Boolean(result?.interrupt),
+            errorMessage: result?.errorMessage || "",
+          };
+        } catch (err) {
+          return { ok: false, error: "execution_failed", message: err?.message || String(err) };
+        }
+      },
+      formatMessage: ({ command = "" } = {}) => `CMD: ${String(command).slice(0, 100)}`,
+      shouldRegister: () => true,
+      stealth: false,
+    });
+    runCommandToolRegistered = true;
+    return true;
+  } catch (err) {
+    console.warn("[agent-subagent] run_command 注册失败:", err?.message || err);
+    return false;
+  }
+}
+
+/** 注册 JS API 工具到 ToolManager（幂等）。 */
+function registerJsApiTool() {
+  if (jsApiToolRegistered) return true;
+  try {
+    const ctx = SillyTavern.getContext();
+    if (typeof ctx.registerFunctionTool !== "function") return false;
+    ctx.registerFunctionTool({
+      name: JSAPI_TOOL_NAME,
+      displayName: "执行 JS API",
+      description:
+        "执行一段受限 JavaScript 代码来读取/检查 SillyTavern 前端公开状态（ctx.* / st.*），" +
+        "例如读取聊天消息、变量、世界书、扩展设置等。代码必须显式 return 最终结果；" +
+        "inspect/read 请求 apiPaths 可省略，effect（副作用）请求建议提供精确 apiPaths。",
+      parameters: {
+        type: "object",
+        properties: {
+          code: { type: "string", description: "要执行的 JS 代码，必须显式 return 结果。可用注入的 ctx 和 st。" },
+          purpose: { type: "string", description: "这段代码要做什么。" },
+          apiPaths: {
+            type: "array",
+            items: { type: "string" },
+            description: "可选：用到的公开 API 路径，如 [\"ctx.chat\"] 或 [\"st.extensions.getContext\"]。",
+          },
+          safety: { type: "string", description: "可选：安全性说明，如 只读 / 会修改哪些状态。" },
+          expectedOutput: { type: "string", description: "预期返回什么结果。" },
+        },
+        required: ["code", "purpose", "expectedOutput"],
+      },
+      action: async (params = {}) => executeJsApiTool(params),
+      formatMessage: (params = {}) => `JS API: ${String(params.purpose || params.code || "").slice(0, 80)}`,
+      shouldRegister: () => true,
+      stealth: false,
+    });
+    jsApiToolRegistered = true;
+    return true;
+  } catch (err) {
+    console.warn("[agent-subagent] JS API tool 注册失败:", err?.message || err);
+    return false;
+  }
+}
+
 export async function init() {
   if (initialized) return;
   initialized = true;
@@ -536,6 +783,10 @@ export async function init() {
   const { locale } = await loadAsaI18n();
   const localeRegistered = registerAsaLocaleKeys(locale);
   createPanel();
+  const cmdOk = registerRunCommandTool();
+  log(cmdOk ? "run_command tool registered." : "run_command tool not registered (ToolManager unavailable).");
+  const jsApiOk = registerJsApiTool();
+  log(jsApiOk ? "JS API tool registered (run_js_api)." : "JS API tool not registered (ToolManager unavailable).");
   log(asaT("asa_loaded") + ` (locale=${locale}, i18n=${asaI18n ? "ok" : "fallback"}, keys=${localeRegistered ? "registered" : "self-rendered only"})`);
   log(`Registered tools available: ${getRegisteredTools().length}`);
 }
