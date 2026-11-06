@@ -24,23 +24,9 @@ function saveSettings(s) {
   } catch {}
 }
 
-let panelAttached = false;
-
-function attachPanel(panel) {
-  if (panelAttached) return;
-  const container = document.querySelector("#extensions_settings");
-  if (container) {
-    panelAttached = true;
-    container.appendChild(panel);
-    return true;
-  }
-  return false;
-}
-
 function createPanel() {
   const panel = document.createElement("div");
   panel.id = "agent_subagent_panel";
-  panel.classList.add("extension_container");
   panel.style.padding = "10px";
 
   panel.innerHTML = `
@@ -58,26 +44,19 @@ function createPanel() {
     <pre id="asa_log" style="margin-top:8px;white-space:pre-wrap;max-height:280px;overflow:auto;background:#111;padding:8px;border-radius:6px;"></pre>
   `;
 
-  if (!attachPanel(panel)) {
-    const tryAttach = () => attachPanel(panel);
-    if (typeof MutationObserver !== "undefined") {
-      const observer = new MutationObserver(() => { if (tryAttach()) observer.disconnect(); });
-      observer.observe(document.body, { childList: true, subtree: true });
-      setTimeout(() => observer.disconnect(), 10000);
-    }
-    setTimeout(() => {
-      if (!panelAttached) {
-        panel.style.position = "fixed";
-        panel.style.bottom = "10px";
-        panel.style.right = "10px";
-        panel.style.zIndex = "9999";
-        panel.style.background = "#222";
-        panel.style.border = "1px solid #555";
-        panel.style.borderRadius = "8px";
-        document.body.appendChild(panel);
-        panelAttached = true;
-      }
-    }, 10000);
+  const container = document.querySelector("#extensions_settings");
+  if (container) {
+    container.appendChild(panel);
+  } else {
+    // Fallback: append to body if extensions_settings not found
+    panel.style.position = "fixed";
+    panel.style.bottom = "10px";
+    panel.style.right = "10px";
+    panel.style.zIndex = "9999";
+    panel.style.background = "#222";
+    panel.style.border = "1px solid #555";
+    panel.style.borderRadius = "8px";
+    document.body.appendChild(panel);
   }
 
   const s = getSettings();
@@ -96,6 +75,7 @@ function createPanel() {
 
   document.querySelector("#asa_run").addEventListener("click", async () => {
     const s = getSettings();
+    // Get last user message from chat
     const chatData = SillyTavern.getContext().chat;
     const lastUser = chatData?.[chatData.length - 1];
     const task = lastUser?.is_user ? lastUser.mes : (s.lastTask || "Continue the current task using tools.");
@@ -115,65 +95,8 @@ function log(text) {
   const time = new Date().toLocaleTimeString();
   el.textContent += `[${time}] ${text}\n`;
   el.scrollTop = el.scrollHeight;
-  asaChatLogs.push(`[${time}] ${text}`);
-  if (asaChatMsgId) asaChatUpdate("运行中");
 }
 
-/* ---------------- 聊天内运行状态消息 ---------------- */
-let asaChatMsgId = null;
-let asaChatLogs = [];
-let asaTaskText = "";
-
-function asaEscapeHtml(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function asaRenderBody(status, finalText) {
-  let body = `<div style="margin:4px 0;"><b>任务:</b> ${asaEscapeHtml(asaTaskText)}</div>`;
-  body += `<div style="margin:4px 0;"><b>状态:</b> ${asaEscapeHtml(status || "运行中")}</div>`;
-  if (finalText) body += `<div style="margin:4px 0;"><b>最终输出:</b></div><div style="white-space:pre-wrap;">${asaEscapeHtml(finalText)}</div>`;
-  if (asaChatLogs.length) body += `<div style="margin:4px 0;"><b>日志:</b></div><div style="white-space:pre-wrap;max-height:320px;overflow:auto;">${asaChatLogs.map(l => asaEscapeHtml(l)).join("<br>")}</div>`;
-  return body;
-}
-
-/** 启动时推一条系统消息进当前聊天（与 ST 工具调用消息同款：is_system + isSmallSys）。 */
-function asaChatStart(task) {
-  asaChatMsgId = null;
-  asaChatLogs = [];
-  asaTaskText = task;
-  try {
-    const ctx = SillyTavern.getContext();
-    if (!Array.isArray(ctx.chat) || ctx.chat.length === 0) return;
-    const id = Date.now() + "_asa_" + Math.random().toString(36).slice(2, 8);
-    const mes = `<details><summary>Subagent · 运行中</summary><div class="asa_chat_body">${asaRenderBody("运行中")}</div></details>`;
-    ctx.chat.push({ name: ctx.name2, force_avatar: true, is_system: true, is_user: false, mes, extra: { isSmallSys: true }, unique_id: id });
-    try {
-      ctx.addOneMessage({ id, mes, name: ctx.name2, is_system: true, is_user: false, force_avatar: true, extra: { isSmallSys: true } }, { scroll: true });
-    } catch (e) { console.warn("[agent-subagent] addOneMessage failed:", e); }
-    asaChatMsgId = id;
-  } catch (e) { console.warn("[agent-subagent] asaChatStart failed:", e); }
-}
-
-/** 运行中/结束时就地更新聊天里的状态消息（点开可看当前输出）。 */
-function asaChatUpdate(status, finalText) {
-  if (!asaChatMsgId) return;
-  try {
-    const ctx = SillyTavern.getContext();
-    const m = ctx.chat.find(x => x && (x.unique_id === asaChatMsgId || x.id === asaChatMsgId));
-    if (!m) return;
-    m.mes = `<details><summary>Subagent · ${asaEscapeHtml(status)}</summary><div class="asa_chat_body">${asaRenderBody(status, finalText)}</div></details>`;
-    const el = document.querySelector(`#mes_${asaChatMsgId}`);
-    if (el) el.innerHTML = m.mes;
-  } catch (e) { console.warn("[agent-subagent] asaChatUpdate failed:", e); }
-}
-
-/** 结束后持久化当前聊天。 */
-async function asaChatSave() {
-  try {
-    const ctx = SillyTavern.getContext();
-    if (typeof ctx.saveChatConditional === "function") await ctx.saveChatConditional();
-  } catch (e) { console.warn("[agent-subagent] saveChatConditional failed:", e); }
-}
 /**
  * Collect all currently registered tools from ToolManager
  * and convert them to OpenAI function calling format.
@@ -185,24 +108,15 @@ function getRegisteredTools() {
     if (!Array.isArray(tools) || tools.length === 0) return [];
 
     return tools
-      .map(t => {
-        if (!t || typeof t.toFunctionOpenAI !== "function") return null;
-        try {
-          const fn = t.toFunctionOpenAI();
-          if (!fn?.function?.name) return null;
-          return {
-            type: "function",
-            function: {
-              name: fn.function.name,
-              description: fn.function.description || "",
-              parameters: fn.function.parameters || { type: "object", properties: {} },
-            },
-          };
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
+      .filter(t => t && t.name)
+      .map(t => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description || "",
+          parameters: t.parameters || { type: "object", properties: {} },
+        },
+      }));
   } catch {
     return [];
   }
@@ -210,272 +124,55 @@ function getRegisteredTools() {
 
 /**
  * Invoke a registered tool by name using ToolManager.
- * 返回结构化结果，明确区分"未注册"、"执行抛错"、"工具自身返回失败"。
  */
 async function invokeTool(name, args) {
-  const ctx = SillyTavern.getContext();
-  if (!ctx.ToolManager || typeof ctx.ToolManager.invokeFunctionTool !== "function") {
-    return { ok: false, kind: "TOOL_NOT_FOUND", result: `[TOOL_NOT_FOUND] ToolManager unavailable in this SillyTavern build; cannot invoke "${name}".` };
-  }
-  try {
-    const result = await ctx.ToolManager.invokeFunctionTool(name, args);
-    if (result instanceof Error) {
-      return { ok: false, kind: "TOOL_ERROR", result: `[TOOL_ERROR] Tool "${name}" threw: ${result.message || result}` };
-    }
-    if (result && typeof result === "object" && !Array.isArray(result) && result.ok === false) {
-      const detail = result.error || result.errorMessage || "tool reported failure";
-      return { ok: false, kind: "TOOL_FAILED", result: `[TOOL_FAILED] Tool "${name}" reported failure: ${detail}` };
-    }
-    return { ok: true, kind: "OK", result: typeof result === "string" ? result : JSON.stringify(result) };
-  } catch (err) {
-    return { ok: false, kind: "TOOL_ERROR", result: `[TOOL_ERROR] Tool "${name}" threw: ${err?.message || err}` };
-  }
-}
-
-const JSAPI_TOOL_NAME = "run_js_api";
-const RUN_COMMAND_TOOL_NAME = "run_command";
-
-function normalizeJsApiOutput(output) {
-  if (output === undefined || output === "") return "";
-  if (typeof output === "string") return output;
-  try {
-    return JSON.stringify(output, null, 2);
-  } catch {
-    return String(output);
-  }
-}
-
-async function loadLwbJsApiRuntime() {
-  const base = "/scripts/extensions/third-party/LittleWhiteBox/modules/assistant";
-  const manifestResponse = await fetch(`${base}/st-jsapi-manifest.json`, { cache: "no-cache" });
-  if (!manifestResponse.ok) throw new Error(`jsapi_manifest_load_failed:${manifestResponse.status}`);
-  const manifest = await manifestResponse.json();
-  const runtimeModule = await import(`${base}/runtime-src/jsapi-runtime.js`);
-  if (typeof runtimeModule?.runJavaScriptApi !== "function") throw new Error("jsapi_runtime_missing_runJavaScriptApi");
-  return { manifest, runtimeModule };
-}
-
-async function executeInMinimalSandbox(codeText, stContext, st) {
-  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  const runner = new AsyncFunction(
-    "ctx", "st", "JSON", "Math", "Object", "Array", "Date", "String", "Number", "Promise",
-    `"use strict";\n${codeText}`
-  );
-  return await runner(stContext, st, JSON, Math, Object, Array, Date, String, Number, Promise);
-}
-
-async function executeJsApiTool({ code = "", purpose = "", apiPaths = [], safety = "", expectedOutput = "" } = {}) {
-  const codeText = String(code || "").trim();
-  const purposeText = String(purpose || "").trim();
-  const expectedText = String(expectedOutput || "").trim();
-  if (!codeText || !purposeText || !expectedText) {
-    return { ok: false, error: "code、purpose、expectedOutput 均为必填。" };
-  }
-
-  const stContext = SillyTavern.getContext();
-  const st = {
-    extensions: {
-      getContext: () => stContext,
-    },
-    script: {},
-    slash: {},
-  };
-
-  try {
-    const { manifest, runtimeModule } = await loadLwbJsApiRuntime();
-    const result = await runtimeModule.runJavaScriptApi({
-      code: codeText,
-      purpose: purposeText,
-      apiPaths: Array.isArray(apiPaths) ? apiPaths : [],
-      safety: String(safety || ""),
-      expectedOutput: expectedText,
-      manifest: manifest,
-      ctx: stContext,
-      st,
-    });
-
-    return {
-      ok: result?.ok === true,
-      output: normalizeJsApiOutput(result?.output),
-      requestKind: result?.requestKind || "unknown",
-      note: result?.note || "",
-      error: result?.ok ? "" : (result?.execution?.errorMessage || result?.execution?.validationErrors?.join("; ") || "jsapi_failed"),
-    };
-  } catch (lwbErr) {
-    try {
-      const output = await executeInMinimalSandbox(codeText, stContext, st);
-      return {
-        ok: true,
-        output: normalizeJsApiOutput(output),
-        requestKind: "minimal",
-        note: `LittleWhiteBox jsapi-runtime 不可用（${lwbErr?.message || lwbErr}），已回退到内置最小沙箱执行。`,
-      };
-    } catch (fallbackErr) {
-      return {
-        ok: false,
-        error: `jsapi_execution_failed: ${fallbackErr?.message || fallbackErr}`,
-        note: `LittleWhiteBox jsapi-runtime 不可用（${lwbErr?.message || lwbErr}），内置最小沙箱执行也失败。`,
-      };
-    }
-  }
-}
-
-let jsApiToolRegistered = false;
-let runCommandToolRegistered = false;
-
-/** 注册 run_command 工具到 ToolManager（幂等）。执行 slash 命令并返回 pipe 输出。 */
-function registerRunCommandTool() {
-  if (runCommandToolRegistered) return true;
   try {
     const ctx = SillyTavern.getContext();
-    if (typeof ctx.registerFunctionTool !== "function") return false;
-    ctx.registerFunctionTool({
-      name: RUN_COMMAND_TOOL_NAME,
-      displayName: "执行 slash 命令",
-      description:
-        "执行一条 SillyTavern slash 命令（STscript）并返回执行结果。" +
-        "返回对象包含 pipe（命令输出值）、isError、interrupt 等字段。" +
-        "示例：/findentry file=新世界书 field=key 苏哲、/getvar name={{char}}、/setentryfield file=新世界书 uid=123 field=content 新内容",
-      parameters: {
-        type: "object",
-        properties: {
-          command: { type: "string", description: "slash 命令文本，以 / 开头，如 /findentry file=新世界书 field=key 苏哲" },
-        },
-        required: ["command"],
-      },
-      action: async ({ command = "" } = {}) => {
-        const cmd = String(command || "").trim();
-        if (!cmd || !cmd.startsWith("/")) {
-          return { ok: false, error: "invalid_command", message: "command 必须以 / 开头的 slash 命令。" };
-        }
-        try {
-          const result = await st.slash.executeSlashCommandsWithOptions(cmd, { source: "agent-subagent" });
-          return {
-            ok: !result?.isError,
-            pipe: result?.pipe || "",
-            isError: Boolean(result?.isError),
-            interrupt: Boolean(result?.interrupt),
-            errorMessage: result?.errorMessage || "",
-          };
-        } catch (err) {
-          return { ok: false, error: "execution_failed", message: err?.message || String(err) };
-        }
-      },
-      formatMessage: ({ command = "" } = {}) => `CMD: ${String(command).slice(0, 100)}`,
-      shouldRegister: () => true,
-      stealth: false,
-    });
-    runCommandToolRegistered = true;
-    return true;
+    if (ctx.ToolManager && typeof ctx.ToolManager.invokeFunctionTool === "function") {
+      return await ctx.ToolManager.invokeFunctionTool(name, args);
+    }
+    return `Tool not found: ${name}`;
   } catch (err) {
-    console.warn("[agent-subagent] run_command 注册失败:", err?.message || err);
-    return false;
+    return `Tool error: ${err?.message || err}`;
   }
 }
 
-/** 注册 JS API 工具到 ToolManager（幂等）。 */
-function registerJsApiTool() {
-  if (jsApiToolRegistered) return true;
-  try {
-    const ctx = SillyTavern.getContext();
-    if (typeof ctx.registerFunctionTool !== "function") return false;
-    ctx.registerFunctionTool({
-      name: JSAPI_TOOL_NAME,
-      displayName: "执行 JS API",
-      description:
-        "执行一段受限 JavaScript 代码来读取/检查 SillyTavern 前端公开状态（ctx.* / st.*），" +
-        "例如读取聊天消息、变量、世界书、扩展设置等。代码必须显式 return 最终结果；" +
-        "inspect/read 请求 apiPaths 可省略，effect（副作用）请求建议提供精确 apiPaths。",
-      parameters: {
-        type: "object",
-        properties: {
-          code: { type: "string", description: "要执行的 JS 代码，必须显式 return 结果。可用注入的 ctx 和 st。" },
-          purpose: { type: "string", description: "这段代码要做什么。" },
-          apiPaths: {
-            type: "array",
-            items: { type: "string" },
-            description: "可选：用到的公开 API 路径，如 [\"ctx.chat\"] 或 [\"st.extensions.getContext\"]。",
-          },
-          safety: { type: "string", description: "可选：安全性说明，如 只读 / 会修改哪些状态。" },
-          expectedOutput: { type: "string", description: "预期返回什么结果。" },
-        },
-        required: ["code", "purpose", "expectedOutput"],
-      },
-      action: async (params = {}) => executeJsApiTool(params),
-      formatMessage: (params = {}) => `JS API: ${String(params.purpose || params.code || "").slice(0, 80)}`,
-      shouldRegister: () => true,
-      stealth: false,
-    });
-    jsApiToolRegistered = true;
-    return true;
-  } catch (err) {
-    console.warn("[agent-subagent] JS API tool 注册失败:", err?.message || err);
-    return false;
-  }
-}
-
+/**
+ * Call the LLM using generateRawData to get raw response with tool_calls.
+ */
 async function callSubagentLLM(messages, tools) {
   const ctx = SillyTavern.getContext();
-  const settings = ctx.chatCompletionSettings;
-  if (!settings || typeof ctx.getRequestHeaders !== "function" || typeof ctx.getChatCompletionModel !== "function") {
-    throw new Error("缺少 chatCompletionSettings / getRequestHeaders / getChatCompletionModel，无法直连后端。");
+
+  if (typeof ctx.generateRawData !== "function") {
+    throw new Error("generateRawData is not available in this SillyTavern version.");
   }
 
-  const model = ctx.getChatCompletionModel(settings);
-  if (!model) {
-    throw new Error("getChatCompletionModel 返回空，请检查当前 Chat Completion 设置。");
+  // Build a prompt from the messages array
+  // generateRawData accepts a prompt (string or array) + systemPrompt
+  let systemPrompt = "";
+  let userContent = "";
+
+  for (const msg of messages) {
+    if (msg.role === "system") {
+      systemPrompt += (systemPrompt ? "\n" : "") + (msg.content || "");
+    } else if (msg.role === "user") {
+      userContent += (userContent ? "\n" : "") + (msg.content || "");
+    } else if (msg.role === "assistant") {
+      // Append assistant messages to the prompt as context
+      userContent += (userContent ? "\n" : "") + `[Assistant]: ${msg.content || ""}`;
+    } else if (msg.role === "tool") {
+      userContent += (userContent ? "\n" : "") + `[Tool Result (${msg.tool_call_id || ""})]: ${msg.content || ""}`;
+    }
   }
 
-  const generateData = {
-    type: "normal",
-    messages: messages,
-    model: model,
-    temperature: Number(settings.temp_openai),
-    frequency_penalty: Number(settings.freq_pen_openai),
-    presence_penalty: Number(settings.pres_pen_openai),
-    top_p: Number(settings.top_p_openai),
-    max_tokens: settings.openai_max_tokens,
-    stream: false,
-    chat_completion_source: settings.chat_completion_source,
-    user_name: ctx.name1,
-    char_name: ctx.name2,
-    include_reasoning: Boolean(settings.show_thoughts),
-  };
-
-  if (settings.reverse_proxy) {
-    generateData.reverse_proxy = settings.reverse_proxy;
-    generateData.proxy_password = settings.proxy_password;
-  }
-
-  if (settings.chat_completion_source === "custom") {
-    generateData.custom_url = settings.custom_url;
-    if (settings.custom_include_body) generateData.custom_include_body = settings.custom_include_body;
-    if (settings.custom_exclude_body) generateData.custom_exclude_body = settings.custom_exclude_body;
-    if (settings.custom_include_headers) generateData.custom_include_headers = settings.custom_include_headers;
-  }
-
-  if (Array.isArray(tools) && tools.length > 0) {
-    generateData.tools = tools;
-    generateData.tool_choice = "auto";
-  }
-
-  const response = await fetch("/api/backends/chat-completions/generate", {
-    method: "POST",
-    body: JSON.stringify(generateData),
-    headers: ctx.getRequestHeaders(),
-    cache: "no-cache",
+  // Use generateRawData with the assembled prompt
+  // Note: For proper tool calling, we need the API to support it
+  // generateRawData will use the current API's tool calling if tools are registered
+  const data = await ctx.generateRawData({
+    prompt: userContent,
+    systemPrompt: systemPrompt,
   });
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`后端返回 ${response.status}: ${text.slice(0, 300)}`);
-  }
-
-  const data = await response.json();
-  if (data?.error) {
-    const msg = data.error?.message || (typeof data.error === "string" ? data.error : JSON.stringify(data.error));
-    throw new Error(`API 错误: ${msg}`);
-  }
   return data;
 }
 
@@ -492,9 +189,19 @@ async function runSubagent(task) {
   const maxLoops = s.maxLoops ?? 8;
   const subagentName = s.subagentName || "Subagent";
 
-  asaChatStart(task);
   log(`Subagent started: ${subagentName}`);
   log(`Task: ${task}`);
+
+  const systemPrompt =
+    `You are a subagent named ${subagentName}. ` +
+    `Your job is to complete the task by planning, calling tools, and iterating until you have a final answer. ` +
+    `When you call tools, wait for their results before concluding. ` +
+    `When you are done, return only the final answer.`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: task },
+  ];
 
   let tools = [];
   if (s.autoAttachTools) {
@@ -506,56 +213,18 @@ async function runSubagent(task) {
     }
   }
 
-  registerJsApiTool();
-  if (s.autoAttachTools) {
-    const refreshed = getRegisteredTools();
-    if (refreshed.length > tools.length) {
-      tools = refreshed;
-      log(`Attached ${tools.length} registered tool(s): ${tools.map(t => t.function.name).join(", ")}`);
-    }
-  }
-
-  // 工具白名单：排除会递归派生 subagent 的工具，避免无限套娃
-  const EXCLUDED_TOOLS = new Set(["subagent_run", "spawn_agents"]);
-  const attachedNames = tools.map(t => t.function.name).filter(n => !EXCLUDED_TOOLS.has(n));
-  const systemPrompt =
-    `You are a subagent named ${subagentName}. ` +
-    `Your job is to complete the task by planning, calling tools, and iterating until you have a final answer. ` +
-    `When you call tools, wait for their results before concluding. ` +
-    `When you are done, return only the final answer. ` +
-    (attachedNames.length > 0
-      ? `Your available tools are exactly: ${attachedNames.join(", ")}. ` +
-        `You MUST call them directly as function calls with their JSON arguments object — do NOT wrap any of them in a /tools-invoke slash command. ` +
-        `Only use /tools-invoke as a last resort for a tool that is NOT in this list; if you must, the parameters JSON must be wrapped in double quotes with inner double quotes escaped. ` +
-        `Do NOT call subagent_run or spawn_agents (no recursion). `
-      : `You have NO direct tools in this run. Use slash commands (e.g. /tools-invoke parameters="{...}" <tool>) to access functionality; the parameters JSON must be wrapped in double quotes with inner double quotes escaped. ` +
-        `Do NOT call subagent_run or spawn_agents (no recursion). ` ) +
-    `IMPORTANT tool-calling rules: ` +
-    ` (1) Any tool that is already in your function/tool list (e.g. chat_fetch, chat_read, chats_list, chat_stats, worldbook_read, worldbook_write, run_command, run_js_api) MUST be called directly as a function call with its JSON arguments object — do NOT wrap it in a /tools-invoke slash command. ` +
-    ` (2) /tools-invoke is only a fallback for tools you can NOT call directly. Its parser splits on spaces, so the parameters JSON must be wrapped in double quotes with the inner double quotes escaped. Correct example: /tools-invoke parameters="{\\\"file_name\\\":\\\"Assistant - 2026-10-01@18h00m37s598ms\\\",\\\"start\\\":0,\\\"limit\\\":10}" chat_fetch. Bare JSON that contains spaces (like a file_name) will be truncated and fail. ` +
-    ` (3) Prefer direct function calls; they handle spaces and any JSON value correctly.`;
-
-  const messages = [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: task },
-  ];
-
   try {
     for (let loop = 1; loop <= maxLoops; loop++) {
       if (stopRequested) {
         log("Subagent stopped by user.");
-        asaChatUpdate("已停止");
         break;
       }
 
       log(`Loop ${loop}/${maxLoops}`);
 
-      const snapshot = typeof structuredClone === "function"
-        ? structuredClone(messages)
-        : JSON.parse(JSON.stringify(messages));
+      const data = await callSubagentLLM(messages, tools);
 
-      const data = await callSubagentLLM(snapshot, tools);
-
+      // Extract the response
       let content = "";
       let toolCalls = [];
 
@@ -573,12 +242,10 @@ async function runSubagent(task) {
 
       if (!content && toolCalls.length === 0) {
         log("Empty response from model.");
-        asaChatUpdate("结束（空响应）");
         break;
       }
 
       if (toolCalls.length === 0) {
-        asaChatUpdate("已完成", content);
         log(`Subagent finished:\n${content}`);
         break;
       }
@@ -599,34 +266,29 @@ async function runSubagent(task) {
 
         log(`Invoking tool: ${toolName} with args: ${JSON.stringify(args).substring(0, 200)}`);
 
-        const invocation = await invokeTool(toolName, args);
-        const resultText = String(invocation.result ?? "");
-        if (invocation.ok) {
-          log(`Tool result: ${resultText.substring(0, 500)}`);
-        } else {
-          log(`Tool ${invocation.kind || "FAILED"}: ${resultText.substring(0, 500)}`);
-        }
+        const result = await invokeTool(toolName, args);
+        log(`Tool result: ${String(result).substring(0, 500)}`);
 
         messages.push({
           role: "tool",
           tool_call_id: call.id,
-          content: resultText,
+          content: String(result),
         });
       }
 
+      // Push the assistant message with tool calls
       messages.push({
         role: "assistant",
         content: content,
         tool_calls: toolCalls,
       });
+
     }
   } catch (err) {
     log(`Subagent error: ${err?.message || err}`);
-    asaChatUpdate("出错", String(err?.message || err));
   } finally {
     running = false;
     stopRequested = false;
-    await asaChatSave();
   }
 }
 
@@ -634,8 +296,4 @@ export async function init() {
   createPanel();
   log("Agent & Subagent extension loaded.");
   log(`Registered tools available: ${getRegisteredTools().length}`);
-  const cmdOk = registerRunCommandTool();
-  log(cmdOk ? "run_command tool registered." : "run_command tool not registered (ToolManager unavailable).");
-  const jsApiOk = registerJsApiTool();
-  log(jsApiOk ? "JS API tool registered (run_js_api)." : "JS API tool not registered (ToolManager unavailable).");
 }
